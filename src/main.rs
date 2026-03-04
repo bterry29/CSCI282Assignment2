@@ -1,90 +1,331 @@
-// Assignment 1: Adder Compiler - Starter Code
+// Assignment 2: Boa Compiler - Starter Code
 // TODO: Complete this compiler implementation
 //
-// Your task is to implement a compiler for the Adder language
-// that compiles simple arithmetic expressions to x86-64 assembly.
+// Your task is to implement a compiler for the Boa language
+// that compiles expressions with let bindings to x86-64 assembly.
+//
+// Boa extends Adder with:
+//   - Variables (identifiers)
+//   - Let expressions with multiple bindings
+//   - Binary operations: +, -, *
 
-use sexp::*;
+use im::HashMap;
 use sexp::Atom::*;
+use sexp::*;
 use std::env;
 use std::fs::File;
 use std::io::prelude::*;
 
-// TODO: Define the Expr enum for your Abstract Syntax Tree
-// You need variants for: Num, Add1, Sub1, and Negate
-// 
-// Hint: Recursive types in Rust need Box<T>
-// Example: Add1(Box<Expr>)
+// ============= Abstract Syntax Tree =============
+
+/// Unary operators
 #[derive(Debug)]
-enum Expr {
-    Num(i32),
-    Add1(Box<Expr>),
-    Sub1(Box<Expr>),
-    Negate(Box<Expr>)
+enum Op1 {
+    Add1,
+    Sub1,
 }
 
+/// Binary operators
+#[derive(Debug)]
+enum Op2 {
+    Plus,
+    Minus,
+    Times,
+}
+
+/// The Boa expression AST
+///
+/// Grammar:
+///   <expr> := <number>
+///           | <identifier>
+///           | (let (<binding>+) <expr>)
+///           | (add1 <expr>) | (sub1 <expr>)
+///           | (+ <expr> <expr>) | (- <expr> <expr>) | (* <expr> <expr>)
+///   <binding> := (<identifier> <expr>)
+#[derive(Debug)]
+enum Expr {
+    Number(i32),
+    Id(String),
+    Let(Vec<(String, Expr)>, Box<Expr>),
+    UnOp(Op1, Box<Expr>),
+    BinOp(Op2, Box<Expr>, Box<Expr>),
+}
+
+// ============= Assembly Representation =============
+
+/// Values that can appear in assembly instructions
+#[derive(Debug)]
+enum Val {
+    Reg(Reg),
+    Imm(i32),
+    RegOffset(Reg, i32), // e.g., [rsp - 8]
+}
+
+/// Registers we use
+#[derive(Debug)]
+enum Reg {
+    RAX,
+    RSP,
+}
+
+/// Assembly instructions we generate
+#[derive(Debug)]
+enum Instr {
+    IMov(Val, Val),
+    IAdd(Val, Val),
+    ISub(Val, Val),
+    IMul(Val, Val),
+}
+
+// ============= Parsing =============
+
 /// Parse an S-expression into our Expr AST
-/// 
-/// This function converts S-expressions like (add1 5) into
-/// our internal AST representation: Expr::Add1(Box::new(Expr::Num(5)))
+///
+/// Examples of valid Boa expressions:
+///   42                          -> Number(42)
+///   x                           -> Id("x")
+///   (add1 5)                    -> UnOp(Add1, Number(5))
+///   (+ 1 2)                     -> BinOp(Plus, Number(1), Number(2))
+///   (let ((x 5)) x)             -> Let([("x", Number(5))], Id("x"))
+///   (let ((x 5) (y 6)) (+ x y)) -> Let([("x", Number(5)), ("y", Number(6))], BinOp(...))
+///
+/// Error handling:
+///   - Invalid syntax: panic!("Invalid")
+///   - Number out of i32 range: panic!("Invalid")
 fn parse_expr(s: &Sexp) -> Expr {
     match s {
         // TODO: Handle number atoms
-        // Hint: Sexp::Atom(I(n)) => Expr::Num(...)
-        //       You'll need i32::try_from(*n).unwrap()
-        Sexp::Atom(I(n)) => Expr::Num(i32::try_from(*n).unwrap()),
-        Sexp::List(vec) => {
-            match &vec[..]{
-                [Sexp::Atom(S(op)), e] if op == "add1" =>
-                    Expr::Add1(Box::new(parse_expr(e))),
-                [Sexp::Atom(S(op)), e] if op == "sub1"=>
-                    Expr::Sub1(Box::new(parse_expr(e))),
-                //Added the handle for negate operation
-                [Sexp::Atom(S(op)), e] if op == "negate" =>
-                    Expr::Negate(Box::new(parse_expr(e))),
-                _ => panic!("Invalid expression"),
+        // Hint: Sexp::Atom(I(n)) => ...
+        //       Use i32::try_from(*n).unwrap_or_else(|_| panic!("Invalid"))
+        Sexp::Atom(I(n)) => {
+            let n_i32 = i32::try_from(*n).unwrap_or_else(|_| panic!("Invalid"));
+            Expr::Number(n_i32)
+        }
+        // TODO: Handle identifier atoms
+        // Hint: Sexp::Atom(S(name)) => ...
+        //       Make sure to check it's not a reserved keyword
+        Sexp::Atom(S(name)) => {
+            if name == "add1" || name == "sub1" || name == "+" || name == "-" || name == "*" || name == "let" {
+                panic!("Invalid");
             }
+            Expr::Id(name.clone())
+        }
+        // TODO: Handle list expressions
+        // Hint: Sexp::List(vec) => match &vec[..] { ... }
+        Sexp::List(vect) => match &vect[..] {
+             [Sexp::Atom(S(op)), e] if op == "add1" => Expr::UnOp(Op1::Add1, Box::new(parse_expr(e))),
+             [Sexp::Atom(S(op)), e] if op == "sub1" => Expr::UnOp(Op1::Sub1, Box::new(parse_expr(e))),
+             [Sexp::Atom(S(op)), e1, e2] if op == "+" => Expr::BinOp(Op2::Plus, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+             [Sexp::Atom(S(op)), e1, e2] if op == "-" => Expr::BinOp(Op2::Minus, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+             [Sexp::Atom(S(op)), e1, e2] if op == "*" => Expr::BinOp(Op2::Times, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+             [Sexp::Atom(S(op)), Sexp::List(bindings), body] if op == "let" => {
+                 let mut binds = Vec::new();
+                 for b in bindings {
+                     binds.push(parse_bind(b));
+                 }
+                 Expr::Let(binds, Box::new(parse_expr(body)))
+             }
+             _ => panic!("Invalid"),
         },
-        
-        _ => panic!("Invalid expression: {:?}", s),
+        // Cases to handle:
+        //   [Sexp::Atom(S(op)), e] if op == "add1" => UnOp(Add1, ...)
+        //   [Sexp::Atom(S(op)), e] if op == "sub1" => UnOp(Sub1, ...)
+        //   [Sexp::Atom(S(op)), e1, e2] if op == "+" => BinOp(Plus, ...)
+        //   [Sexp::Atom(S(op)), e1, e2] if op == "-" => BinOp(Minus, ...)
+        //   [Sexp::Atom(S(op)), e1, e2] if op == "*" => BinOp(Times, ...)
+        //   [Sexp::Atom(S(op)), Sexp::List(bindings), body] if op == "let" => ...
+
+        _ => panic!("Invalid"),
     }
 }
 
-/// Compile an Expr to x86-64 assembly instructions
-/// 
-/// The goal: generate assembly that evaluates the expression
-/// and leaves the result in the rax register.
+/// Parse a single binding from a let expression
 ///
-/// For example:
-///   Num(5) should generate: "mov rax, 5"
-///   Add1(Num(5)) should generate: "mov rax, 5\nadd rax, 1"
-fn compile_expr(e: &Expr) -> String {
-    match e {
-        // TODO: For Num(n), generate a mov instruction
-        // Format: "mov rax, {}"
-        Expr::Num(n) => format!("mov rax, {}", *n),
-        // TODO: For Add1(subexpr):
-        //   1. Compile the subexpression
-        //   2. Add an instruction to increment rax
-        // Hint: compile_expr(subexpr) + "\nadd rax, 1"
-        Expr::Add1(subexpr) => compile_expr(subexpr)+ "\nadd rax, 1",
-        
-        // TODO: For Sub1(subexpr):
-        //   1. Compile the subexpression
-        //   2. Add an instruction to decrement rax
-        Expr::Sub1(subexpr) => compile_expr(subexpr) + "\nsub rax, 1",
-        
-        // TODO: For Negate(subexpr):
-        //   1. Compile the subexpression
-        //   2. Add an instruction to negate rax
-        // Hint: Use "imul rax, -1" to multiply by -1
-        Expr::Negate(subexpr) => compile_expr(subexpr)+ "\nimul rax, -1"
+/// A binding looks like: (x 5) or (my-var (+ 1 2))
+/// Returns a tuple of (variable_name, expression)
+///
+/// Error handling:
+///   - Invalid binding syntax: panic!("Invalid")
+fn parse_bind(s: &Sexp) -> (String, Expr) {
+    // TODO: Parse a binding of the form (identifier expr)
+    // Hint: match s {
+    //     Sexp::List(vec) => match &vec[..] {
+    //         [Sexp::Atom(S(name)), e] => (name.clone(), parse_expr(e)),
+    //         _ => panic!("Invalid"),
+    //     }
+    //     _ => panic!("Invalid"),
+    // }
+    match s{
+        Sexp::List(vec) => match &vec[..]{
+            [Sexp::Atom(S(name)), e] => (name.clone(), parse_expr(e)),
+            _=> panic!("Invalid"),
+        }
+        _ => panic!("Invalid"),
     }
 }
+
+// ============= Compilation =============
+
+/// Compile an expression to a list of assembly instructions
+///
+/// Parameters:
+///   - e: the expression to compile
+///   - si: stack index - the next available stack slot (starts at 2)
+///         Stack slots are at [rsp - 8*si], e.g., si=2 means [rsp - 16]
+///   - env: environment mapping variable names to stack offsets
+///
+/// The compiled code should leave its result in RAX.
+///
+/// Stack layout:
+///   [rsp - 8]  : reserved (return address area)
+///   [rsp - 16] : first variable (si=2)
+///   [rsp - 24] : second variable (si=3)
+///   ...
+///
+/// Examples:
+///   Number(5) -> [IMov(Reg(RAX), Imm(5))]
+///
+///   UnOp(Add1, Number(5)) ->
+///     [IMov(Reg(RAX), Imm(5)), IAdd(Reg(RAX), Imm(1))]
+///
+///   BinOp(Plus, Number(1), Number(2)) ->
+///     1. Compile left operand (result in RAX)
+///     2. Save RAX to stack at [rsp - 8*si]
+///     3. Compile right operand (result in RAX)
+///     4. Add stack value to RAX
+///
+///   Let([(x, 5)], Id(x)) ->
+///     1. Compile binding expression (5)
+///     2. Store result at stack slot
+///     3. Add x -> stack_offset to environment
+///     4. Compile body with updated environment
+fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr> {
+    match e {
+        // TODO: Number - move immediate value to RAX
+        // vec![IMov(Val::Reg(Reg::RAX), Val::Imm(*n))]
+        Expr::Number(n) => vec![Instr::IMov(Val::Reg(Reg::RAX), Val ::Imm(*n))],
+        // TODO: Id - look up variable in environment, load from stack
+        // 1. Look up name in env to get stack offset
+        //    env.get(name).unwrap_or_else(|| panic!("Unbound variable identifier {}", name))
+        // 2. Generate: IMov(Reg(RAX), RegOffset(RSP, offset))
+        Expr:: Id(name) => {
+            let offset = env.get(name).unwrap_or_else(|| panic!("Unbound variable identifier {}", name));
+            vec![Instr::IMov(Val::Reg(Reg::RAX), Val::RegOffset(Reg::RSP, *offset))]
+        }
+        // TODO: UnOp - compile subexpression, then apply operation
+        // Add1: compile e, then IAdd(Reg(RAX), Imm(1))
+        // Sub1: compile e, then ISub(Reg(RAX), Imm(1))
+        Expr::UnOp(op, e) => {
+            let mut instrs = compile_to_instrs(e, si, env);
+            match op {
+                Op1::Add1 => instrs.push(Instr::IAdd(Val::Reg(Reg::RAX), Val::Imm(1))),
+                Op1::Sub1 => instrs.push(Instr::ISub(Val::Reg(Reg::RAX), Val::Imm(1))),
+            }
+            instrs
+        }
+        // TODO: BinOp - compile both operands using the stack
+        // Strategy:
+        //   1. Compile left operand (result in RAX)
+        //   2. Store RAX at [rsp - 8*si] (save left result)
+        //   3. Compile right operand with si+1 (result in RAX)
+        //   4. Perform operation: stack_value OP rax -> rax
+        //
+        // For Plus:  load left from stack, add rax
+        // For Minus: load left from stack, sub rax
+        // For Times: load left from stack, mul rax
+        //
+        // Hint: You may need to move the left operand back to RAX
+        //       and then apply the operation with the right operand
+        Expr::BinOp(op,e1,e2) => {
+            let mut instrs = compile_to_instrs(e1, si, env);
+
+            instrs.push(Instr::IMov(Val::RegOffset(Reg::RSP, -8*si), Val::Reg(Reg::RAX)));
+            let mut right_instrs = compile_to_instrs(e2, si+1, env);
+            instrs.append(&mut right_instrs);
+            match op {
+                Op2::Plus => instrs.push(Instr::IAdd(Val::Reg(Reg::RAX), Val::RegOffset(Reg::RSP, -8*si))),
+                Op2::Minus => {instrs.push(Instr::IMov(Val::RegOffset(Reg::RSP,-8*(si+1)), Val::Reg(Reg::RAX)));
+                                instrs.push(Instr::IMov(Val::Reg(Reg::RAX),Val::RegOffset(Reg::RSP, -8*si)));
+                                instrs.push(Instr::ISub(Val::Reg(Reg::RAX), Val::RegOffset(Reg::RSP, -8*(si+1))))},
+                Op2::Times => instrs.push(Instr::IMul(Val::Reg(Reg::RAX), Val::RegOffset(Reg::RSP, -8*si))),
+            }
+            instrs
+        }
+        // TODO: Let - bind variables and compile body
+        // Strategy:
+        //   1. Check for duplicate bindings - panic!("Duplicate binding")
+        //   2. For each binding (name, expr):
+        //      a. Compile expr with current si and env
+        //      b. Store result at [rsp - 8*si]
+        //      c. Add name -> -8*si to env
+        //      d. Increment si
+        //   3. Compile body with final si and env
+        //
+        // Duplicate check: Keep a set of names seen so far
+        // If you see a name twice, panic!("Duplicate binding")
+        Expr::Let(bindings, body) => {
+            let mut instrs = Vec::new();
+            let mut seen = HashMap::new();
+            let mut current_env = env.clone();
+            let mut current_si = si;
+            for (name, expr) in bindings {
+                if seen.contains_key(name) {
+                    panic!("Duplicate binding");
+                }
+                seen.insert(name.clone(), true);
+                let mut bind_instrs = compile_to_instrs(expr, current_si, &current_env);
+                instrs.append(&mut bind_instrs);
+                instrs.push(Instr::IMov(Val::RegOffset(Reg::RSP, -8*current_si), Val::Reg(Reg::RAX)));
+                current_env.insert(name.clone(), -8*current_si);
+                current_si += 1;
+            }
+            let mut body_instrs = compile_to_instrs(body, current_si, &current_env);
+            instrs.append(&mut body_instrs);
+            instrs
+        }
+        _ => panic!("Invalid {:?}", e),
+    }
+}
+
+// ============= Code Generation =============
+
+/// Convert a Val to its assembly string representation
+fn val_to_str(v: &Val) -> String {
+    match v {
+        Val::Reg(Reg::RAX) => String::from("rax"),
+        Val::Reg(Reg::RSP) => String::from("rsp"),
+        Val::Imm(n) => format!("{}", n),
+        Val::RegOffset(Reg::RSP, offset) => format!("[rsp + {}]", offset),
+        Val::RegOffset(Reg::RAX, offset) => format!("[rax + {}]", offset),
+    }
+}
+
+/// Convert an Instr to its assembly string representation
+fn instr_to_str(i: &Instr) -> String {
+    match i {
+        Instr::IMov(dst, src) => format!("mov {}, {}", val_to_str(dst), val_to_str(src)),
+        Instr::IAdd(dst, src) => format!("add {}, {}", val_to_str(dst), val_to_str(src)),
+        Instr::ISub(dst, src) => format!("sub {}, {}", val_to_str(dst), val_to_str(src)),
+        Instr::IMul(dst, src) => format!("imul {}, {}", val_to_str(dst), val_to_str(src)),
+    }
+}
+
+/// Compile an expression to a complete assembly string
+fn compile(e: &Expr) -> String {
+    let env: HashMap<String, i32> = HashMap::new();
+    let instrs = compile_to_instrs(e, 2, &env);
+    instrs
+        .iter()
+        .map(|i| instr_to_str(i))
+        .collect::<Vec<String>>()
+        .join("\n  ")
+}
+
+// ============= Main =============
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() != 3 {
         eprintln!("Usage: {} <input.snek> <output.s>", args[0]);
         std::process::exit(1);
@@ -99,16 +340,14 @@ fn main() -> std::io::Result<()> {
     in_file.read_to_string(&mut in_contents)?;
 
     // Parse S-expression from text
-    let sexp = parse(&in_contents).unwrap_or_else(|e| {
-        panic!("Parse error: {}", e)
-    });
-    
+    let sexp = parse(&in_contents).unwrap_or_else(|_| panic!("Invalid"));
+
     // Convert S-expression to our AST
     let expr = parse_expr(&sexp);
-    
+
     // Generate assembly instructions
-    let instrs = compile_expr(&expr);
-    
+    let instrs = compile(&expr);
+
     // Wrap instructions in assembly program template
     let asm_program = format!(
         "section .text
@@ -127,25 +366,109 @@ our_code_starts_here:
     Ok(())
 }
 
-// ============= TESTS (Optional but recommended) =============
-// 
-// Uncomment and run with: cargo test
+// ============= TESTS =============
+//
+// Run with: cargo test
+//
+// These tests help verify your implementation. Uncomment and add more!
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-//     #[test]
-//     fn test_parse_number() {
-//         let sexp = parse("42").unwrap();
-//         let expr = parse_expr(&sexp);
-//         // Add your assertions here
-//     }
+    // Helper to parse a string directly
+    fn parse_str(s: &str) -> Expr {
+        parse_expr(&parse(s).unwrap())
+    }
 
-//     #[test]
-//     fn test_compile_number() {
-//         let expr = Expr::Num(42);
-//         let asm = compile_expr(&expr);
-//         assert_eq!(asm, "mov rax, 42");
-//     }
-// }
+    // ===== Parsing Tests =====
+
+    #[test]
+    fn test_parse_number() {
+        let expr = parse_str("42");
+        match expr {
+            Expr::Number(42) => (),
+            _ => panic!("Expected Number(42), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_identifier() {
+        let expr = parse_str("x");
+        match expr {
+            Expr::Id(name) => assert_eq!(name, "x"),
+            _ => panic!("Expected Id(\"x\"), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_add1() {
+        let expr = parse_str("(add1 5)");
+        match expr {
+            Expr::UnOp(Op1::Add1, _) => (),
+            _ => panic!("Expected UnOp(Add1, ...), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_binary_plus() {
+        let expr = parse_str("(+ 1 2)");
+        match expr {
+            Expr::BinOp(Op2::Plus, _, _) => (),
+            _ => panic!("Expected BinOp(Plus, ...), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_let_simple() {
+        let expr = parse_str("(let ((x 5)) x)");
+        match expr {
+            Expr::Let(bindings, _) => {
+                assert_eq!(bindings.len(), 1);
+                assert_eq!(bindings[0].0, "x");
+            }
+            _ => panic!("Expected Let, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_let_multiple_bindings() {
+        let expr = parse_str("(let ((x 5) (y 6)) (+ x y))");
+        match expr {
+            Expr::Let(bindings, _) => {
+                assert_eq!(bindings.len(), 2);
+            }
+            _ => panic!("Expected Let with 2 bindings, got {:?}", expr),
+        }
+    }
+
+    // ===== Error Tests =====
+
+    #[test]
+    #[should_panic(expected = "Duplicate binding")]
+    fn test_duplicate_binding() {
+        let expr = parse_str("(let ((x 1) (x 2)) x)");
+        let env: HashMap<String, i32> = HashMap::new();
+        compile_to_instrs(&expr, 2, &env);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unbound variable identifier y")]
+    fn test_unbound_variable() {
+        let expr = parse_str("y");
+        let env: HashMap<String, i32> = HashMap::new();
+        compile_to_instrs(&expr, 2, &env);
+    }
+
+    // ===== Compilation Tests =====
+
+    #[test]
+    fn test_compile_number() {
+        let expr = Expr::Number(42);
+        let env: HashMap<String, i32> = HashMap::new();
+        let instrs = compile_to_instrs(&expr, 2, &env);
+        assert_eq!(instrs.len(), 1);
+    }
+
+    // Add more tests as you implement features!
+}
